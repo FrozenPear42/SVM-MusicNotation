@@ -69,23 +69,30 @@ def train(dataset_path, model_path):
     print(f"Score: {score}")
 
 
-def predict(model_path):
+def predict(model_path, args):
     scaler, classifier = load_model(model_path)
 
-    while True:
-        inp = sys.stdin.readline()
-        if inp == '':
-            break
-        inp = inp.strip()
-        print(inp)
-        try:
-            features = process_input(inp)
-            features_scaled = scaler.transform([features])
-            print(features_scaled)
-            prediction = classifier.predict(features_scaled)
-            print(prediction)
-        except Exception as e:
-            print(f"error {e}")
+    if args.interactive:
+        while True:
+            print("enter path: ")
+            inp = sys.stdin.readline()
+            if inp == '':
+                break
+            inp = inp.strip()
+            print(inp)
+            try:
+                features = process_input(inp)
+                features_scaled = scaler.transform([features])
+                print(features_scaled)
+                prediction = classifier.predict(features_scaled)
+                print(prediction)
+            except Exception as e:
+                print(f"error {e}")
+    else:
+        features = process_input(args.image)
+        features_scaled = scaler.transform([features])
+        prediction = classifier.predict(features_scaled)
+        print(f"predicted class: {prediction}")
 
 
 def process_input(image_path):
@@ -133,7 +140,11 @@ def parse_arguments():
     if args.command == "train":
         pass
     elif args.command == "predict":
-        pass
+        sub_parser = argparse.ArgumentParser()
+        sub_parser.add_argument("--interactive")
+        sub_parser.add_argument("--image")
+        sub_args = sub_parser.parse_args((sys.argv[2:]))
+        return args.command, sub_args
     else:
         print('Unrecognized command')
         parser.print_help()
@@ -162,7 +173,7 @@ def main():
     if command == "train":
         train("./dataset/regular", "./model.pkl")
     elif command == "predict":
-        predict("./model.pkl")
+        predict("./model.pkl", args)
 
 
 if __name__ == "__main__":
