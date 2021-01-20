@@ -12,6 +12,7 @@ Pillow = "^8.0.1"
 mahotas = "^1.4.11"
 
 [tool.poetry.dev-dependencies]
+autopep8 = "^1.5.4"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

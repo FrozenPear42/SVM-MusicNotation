@@ -2,71 +2,86 @@ import os
 import os.path
 import glob
 import json
-import random
 import cv2
 import sys
 import mahotas
 import numpy as np
 import sklearn.preprocessing
 from sklearn.svm import SVC
+from sklearn.multiclass import OneVsRestClassifier
 from sklearn.model_selection import train_test_split
 import pickle
 import argparse
 
 
-def train(dataset_path, model_path):
+def prepare_dataset(dataset_path, output_path):
     classes = {}
+    input_size = (0, 4116)
 
     for meta in glob.glob(dataset_path + "/*.json"):
         with open(meta, "r") as file:
             data = json.load(file)
             classes = {**classes, **data}
 
-    dataset = [(os.path.join(dataset_path, ex[0]), ex[1]) for ex in list(classes.items())]
+    dataset = [(os.path.join(dataset_path, file), cls)
+               for [file, cls] in list(classes.items())]
 
-    dataset_x = [x[0] for x in dataset]
-    dataset_y = [x[1] for x in dataset]
+    files = [x[0] for x in dataset]
+    target = [x[1] for x in dataset]
+    features = np.empty(input_size, float)
+
+    for idx, file in enumerate(files):
+        if idx % 500 == 0:
+            print(f"progress: {idx}/{len(files)}")
+        try:
+            extracted_features = process_input(file)
+            features = np.append(features, [extracted_features], axis=0)
+        except Exception as e:
+            print(e)
+
+    prepared = zip(files, features, target)
+    save_dataset(output_path, prepared)
+
+
+def save_dataset(dataset_path, dataset):
+    with open(dataset_path, "wb") as f:
+        pickle.dump(dataset, f)
+
+
+def load_dataset(dataset_path):
+    with open(dataset_path, 'rb') as f:
+        dataset = pickle.load(f)
+    return dataset
+
+
+def train(dataset, model_path, ratio, threads, **kwargs):
+
+    dataset = tuple(dataset)
+
+    features = [d[1] for d in dataset]
+    classes = [d[2] for d in dataset]
 
     x_train, x_test, y_train, y_test = train_test_split(
-        dataset_x, dataset_y, test_size=0.33, random_state=4, stratify=dataset_y)
-
-    input_size = (0, 4116)
-
-    xs = np.empty(input_size, float)
-    ys = []
-    train_count = len(x_train)
-    for idx, ex in enumerate(x_train):
-        if idx % 500 == 0:
-            print(f"fprgress: {idx}/{train_count}")
-
-        try:
-            features = process_input(ex)
-            xs = np.append(xs, [features], axis=0)
-            ys.append(y_train[idx])
-        except Exception as e:
-            print(e)
+        features, classes, test_size=ratio, random_state=4, stratify=classes)
 
     scaler = sklearn.preprocessing.MinMaxScaler(feature_range=(0, 1))
-    scaler.fit(xs)
+    scaler.fit(x_train)
+    train_features_scaled = scaler.transform(x_train)
 
-    xs_scaled = scaler.transform(xs)
-
-    classifier = SVC(verbose=True)
-    classifier.fit(xs_scaled, ys)
-
+    classifier = OneVsRestClassifier(SVC(**kwargs), n_jobs=threads)
+    classifier.fit(train_features_scaled, y_train)
     save_model(model_path, scaler, classifier)
+    print(f"Fitted and saved model to {model_path}")
 
-    xs_test = np.empty(input_size, float)
-    ys_test = y_test
-    for ex in x_test:
-        try:
-            features = process_input(ex)
-            xs_test = np.append(xs_test, [features], axis=0)
-        except Exception as e:
-            print(e)
+    test_features_scaled = scaler.transform(x_test)
 
-    score = classifier.score(xs_test, ys_test)
-    print(f"Score: {score}")
+    print(f"Calculating scores...")
+
+    train_score = classifier.score(train_features_scaled, y_train)
+    print(f"Score (train (no. samples {len(y_train)})): {train_score}")
+
+    test_score = classifier.score(test_features_scaled, y_test)
+    print(f"Score (test (no. samples {len(y_test)})): {test_score}")
 
 
 def predict(model_path, args):
@@ -127,30 +142,59 @@ def extract_haralick_features(image):
 def extract_histogram(image):
     image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    hist = cv2.calcHist([image], [0, 1, 2], None, [16, 16, 16], [0, 256, 0, 256, 0, 256])
+    hist = cv2.calcHist([image], [0, 1, 2], None, [
+                        16, 16, 16], [0, 256, 0, 256, 0, 256])
     hist = cv2.normalize(hist, None)
     hist = hist.flatten()
     return hist
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Process some integers.')
-    parser.add_argument("command", help="subcommand to run")
+    parser = argparse.ArgumentParser(
+        description='SVM Music Notation classifier')
+    parser.add_argument("command", help="subcommand to run", choices=[
+                        'train', 'predict', 'build-dataset'])
     args = parser.parse_args(sys.argv[1:2])
     if args.command == "train":
-        pass
+        sub_parser = argparse.ArgumentParser()
+        sub_parser.add_argument("--dataset", dest="dataset", required=True)
+        sub_parser.add_argument("--output", dest="output", required=True)
+        sub_parser.add_argument("--ratio", dest="ratio",
+                                type=float, default=0.33)
+        sub_parser.add_argument(
+            "--coeffc", dest="coeffc", type=float, default=1.0)
+        sub_parser.add_argument(
+            "--coeff0", dest="coeff0", type=float, default=0.0)
+        sub_parser.add_argument("--kernel", dest="kernel", default="rbf")
+        sub_parser.add_argument("--gamma", dest="gamma", default="scale")
+        sub_parser.add_argument(
+            "--tolerance", dest="tolerance", type=float, default=0.001)
+        sub_parser.add_argument(
+            "--cache_size", dest="cache_size", type=int, default=8000)
+        sub_parser.add_argument(
+            "--threads", dest="threads", type=int, default=32)
+        sub_parser.add_argument(
+            "--max_iter", dest="max_iter", type=int, default=-1)
+        sub_args = sub_parser.parse_args((sys.argv[2:]))
+        return args.command, sub_args
     elif args.command == "predict":
         sub_parser = argparse.ArgumentParser()
-        sub_parser.add_argument("--interactive")
-        sub_parser.add_argument("--image")
+        sub_parser.add_argument("--interactive", dest="interactive")
+        sub_parser.add_argument("--image", dest="image")
+        sub_parser.add_argument("--model", dest="model", required=True)
+        sub_args = sub_parser.parse_args((sys.argv[2:]))
+        return args.command, sub_args
+    elif args.command == "build-dataset":
+        sub_parser = argparse.ArgumentParser()
+        sub_parser.add_argument(
+            "--raw-dataset", dest="raw_dataset", required=True)
+        sub_parser.add_argument("--output", dest="output", required=True)
         sub_args = sub_parser.parse_args((sys.argv[2:]))
         return args.command, sub_args
     else:
         print('Unrecognized command')
         parser.print_help()
         exit(1)
-
-    return args.command, None
 
 
 def load_model(file_path):
@@ -171,9 +215,14 @@ def save_model(file_path, scaler, classifier):
 def main():
     command, args = parse_arguments()
     if command == "train":
-        train("./dataset/regular", "./model.pkl")
+        dataset = load_dataset(args.dataset)
+        train(dataset, args.output, args.ratio, args.threads,
+              C=args.coeffc, coef0=args.coeff0, kernel=args.kernel, gamma=args.gamma,
+              tol=args.tolerance, cache_size=args.cache_size, max_iter=args.max_iter)
     elif command == "predict":
-        predict("./model.pkl", args)
+        predict(args.model, args)
+    elif command == "build-dataset":
+        prepare_dataset(args.raw_dataset, args.output)
 
 
 if __name__ == "__main__":
