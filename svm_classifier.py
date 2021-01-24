@@ -4,14 +4,22 @@ import glob
 import json
 import cv2
 import sys
+import json
+import pickle
 import mahotas
+import argparse
 import numpy as np
 import sklearn.preprocessing
 from sklearn.svm import SVC
+from sklearn.metrics import confusion_matrix
+from sklearn.pipeline import Pipeline
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.model_selection import train_test_split
-import pickle
-import argparse
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV
+from sklearn.utils.multiclass import unique_labels
+from sklearn.utils import gen_batches
+from joblib import Parallel, delayed
 
 
 def prepare_dataset(dataset_path, output_path):
@@ -84,6 +92,77 @@ def train(dataset, model_path, ratio, threads, **kwargs):
     print(f"Score (test (no. samples {len(y_test)})): {test_score}")
 
 
+def _predict(estimator, X, start, stop):
+    return estimator.predict((X[start:stop]))
+
+
+def score_function(clf, X, y):
+
+    batches_per_job = 3
+    n_jobs = 16
+    n_batches = batches_per_job * n_jobs
+    n_samples = len(X)
+    batch_size = int(np.ceil(n_samples / n_batches))
+    parallel = Parallel(n_jobs=n_jobs)
+    results = parallel(delayed(_predict)(clf, X, i, i + batch_size)
+                       for i in range(0, n_samples, batch_size))
+    y_pred = np.concatenate(results)
+
+    c_matrix_acc = confusion_matrix(y, y_pred, normalize='all')
+    c_matrix_rel = confusion_matrix(y, y_pred, normalize='true')
+    labels = unique_labels(y, y_pred)
+
+    accuracy_all = list(zip(labels, np.diagonal(c_matrix_acc)))
+    accuracy_rel = list(zip(labels, np.diagonal(c_matrix_rel)))
+
+    return {
+        'correct': np.sum([value for (label, value) in accuracy_all]),
+        **{label: value for (label, value) in accuracy_rel},
+        # **{labels[coord[0]]+"-" + labels[coord[1]]: x for coord, x in np.ndenumerate(c_matrix)}
+    }
+
+
+def grid_search(dataset, param_grid, cv=5, n_jobs=-1):
+    dataset = tuple(dataset)
+
+    features = [d[1] for d in dataset]
+    classes = [d[2] for d in dataset]
+
+    pipe_estimator = Pipeline([
+        ('scaler', MinMaxScaler(feature_range=(0, 1))),
+        ('ovr', OneVsRestClassifier(SVC(), n_jobs=-1))
+    ])
+    print(param_grid)
+    parsed_param_grid = [
+        {("ovr__estimator__" + k): v for (k, v) in bundle.items()}
+        for bundle in param_grid]
+
+    search_estimator = GridSearchCV(
+        pipe_estimator,
+        parsed_param_grid,
+        n_jobs=n_jobs,
+        cv=cv,
+        verbose=10,
+        scoring=score_function,
+        refit='correct',
+        return_train_score=False
+    )
+    search_estimator.fit(features, classes)
+    return search_estimator
+
+
+def run_grid_search(dataset, output_path, param_grid=None, cv=5, n_jobs=4):
+    if param_grid is None:
+        param_grid = [
+            # {'C': [0.1, 10], 'kernel': ['linear']},
+            {'C': [100, 10000], 'gamma': [0.1, 1], 'kernel': ['poly']},
+        ]
+    model_grid = grid_search(dataset, param_grid, cv, n_jobs=n_jobs)
+
+    with open(output_path, "wb") as f:
+        pickle.dump(model_grid, f)
+
+
 def predict(model_path, args):
     scaler, classifier = load_model(model_path)
 
@@ -153,7 +232,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description='SVM Music Notation classifier')
     parser.add_argument("command", help="subcommand to run", choices=[
-                        'train', 'predict', 'build-dataset'])
+                        'train', 'predict', 'build-dataset', 'grid-search'])
     args = parser.parse_args(sys.argv[1:2])
     if args.command == "train":
         sub_parser = argparse.ArgumentParser()
@@ -191,6 +270,13 @@ def parse_arguments():
         sub_parser.add_argument("--output", dest="output", required=True)
         sub_args = sub_parser.parse_args((sys.argv[2:]))
         return args.command, sub_args
+    elif args.command == "grid-search":
+        sub_parser = argparse.ArgumentParser()
+        sub_parser.add_argument(
+            "--dataset", dest="dataset", required=True)
+        sub_parser.add_argument("--output", dest="output", required=True)
+        sub_args = sub_parser.parse_args((sys.argv[2:]))
+        return args.command, sub_args
     else:
         print('Unrecognized command')
         parser.print_help()
@@ -223,6 +309,9 @@ def main():
         predict(args.model, args)
     elif command == "build-dataset":
         prepare_dataset(args.raw_dataset, args.output)
+    elif command == "grid-search":
+        dataset = load_dataset(args.dataset)
+        run_grid_search(dataset, args.output, cv=3)
 
 
 if __name__ == "__main__":
